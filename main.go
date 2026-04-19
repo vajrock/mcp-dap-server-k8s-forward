@@ -15,12 +15,18 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-var version = "0.2.2"
+var version = "0.2.3"
 
 func main() {
 	// CLI flag parsing
 	connectAddr := flag.String("connect", "", "TCP address of existing dlv --headless DAP server (e.g. localhost:24010 after kubectl port-forward)")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		os.Exit(0)
+	}
 
 	// Env fallback (ADR-9: CLI has precedence over env)
 	addr := *connectAddr
