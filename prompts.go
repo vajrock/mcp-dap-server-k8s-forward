@@ -238,14 +238,22 @@ You are attaching to a **running process** to diagnose its live behavior.%s
 
 ### Step 1: Attach to the process
 
+Two sub-cases of attach — pick the one matching your setup:
+
+**(a) LOCAL attach by PID:**
 Call: `+"`"+`debug(mode="attach", processId=%s)`+"`"+`
 
-Expected: The debugger attaches and the process pauses. You will see the current execution location.
+**(b) PRE-CONNECTED (remote k8s via ConnectBackend):**
+If this mcp-dap-server was started with `+"`"+`--connect`+"`"+` / `+"`"+`DAP_CONNECT_ADDR`+"`"+` (the wrapper script `+"`"+`dlv-k8s-mcp.sh`+"`"+` does this automatically), the remote dlv in the pod already owns the target. Call:
+`+"`"+`debug(mode="attach")`+"`"+` — no processId, no port.
+
+If you cannot tell which sub-case applies: try (b) first; if you get `+"`"+`processId is required for attach mode`+"`"+` the setup is (a) and you need the PID.
+
+Expected (both sub-cases, v0.2.1+): the call returns immediately with a readiness message. The debuggee is already running; no stop event will arrive until a breakpoint is hit by an external trigger.
 
 **If attach fails:**
-- Verify the PID is correct: `+"`"+`ps aux | grep <process-name>`+"`"+`
-- Check permissions: you may need to run as root or set `+"`"+`ptrace_scope`+"`"+`
-- The process may have already exited
+- Sub-case (a): verify the PID, check `+"`"+`ptrace_scope`+"`"+` (`+"`"+`cat /proc/sys/kernel/yama/ptrace_scope`+"`"+`), try with elevated permissions, confirm the process hasn't exited.
+- Sub-case (b): tail `+"`"+`/tmp/mcp-dap-server.<ns>-<svc>.latest.log`+"`"+` — the startup banner should read `+"`"+`ConnectBackend mode, target localhost:NNNNN`+"`"+`. If it's missing, you're accidentally in (a); ask the operator.
 
 ---
 

@@ -44,15 +44,49 @@ func (ds *debuggerSession) defaultThreadID() int {
 	return 1
 }
 
-const debugToolDescription = `Start a complete debugging session. Returns full context at first breakpoint.
+const debugToolDescription = `Start a debugging session.
 
-Modes: 'source' (compile & debug), 'binary' (debug executable), 'core' (debug core dump), 'attach' (connect to process).
+Modes:
+- 'source': compile a program from source and debug it. Spawns dlv. Requires 'path'.
+- 'binary': debug a pre-compiled executable. Spawns dlv/gdb. Requires 'path'.
+- 'core': post-mortem analysis of a core dump. Requires 'path' + 'coreFilePath'.
+- 'attach': attach to an already-running debugger session. Two sub-cases, auto-detected:
 
-Debugger selection (via 'debugger' parameter):
-- 'delve' (default): For Go programs only. Requires dlv to be installed.
-- 'gdb': For C/C++/Rust and other compiled languages. Requires GDB 14+ with native DAP support (gdb -i dap). GDB does not support 'source' mode; compile your program with debug symbols (gcc -g -O0) and use 'binary' mode.
+    (a) LOCAL attach — this mcp-dap-server spawns dlv locally and attaches it
+        by PID to a running process on the same machine. Requires 'processId'.
 
-Choose the debugger based on the language of the program being debugged: use 'delve' for Go, use 'gdb' for C/C++/Rust.`
+    (b) PRE-CONNECTED attach — this mcp-dap-server was started with the
+        --connect flag or DAP_CONNECT_ADDR env var and is already wired to
+        a remote dlv --headless --accept-multiclient server (typical for the
+        k8s wrapper script scenario: kubectl port-forward + dlv in a pod).
+        Call debug(mode="attach") with NO processId — the remote dlv already
+        owns its target. If you pass a 'mode' other than "attach" in this
+        setup it is silently normalised.
+
+How to tell which sub-case applies: if the MCP server's startup message in
+the log mentions "ConnectBackend mode, target localhost:NNNNN", you are in
+sub-case (b). The Claude-side wrapper script (dlv-k8s-mcp.sh) and the
+--connect flag configuration in .mcp.json are operator setup details; the
+MCP caller (you) never chooses between (a) and (b) — you just pass
+mode="attach" and the server routes correctly.
+
+Debugger selection (via 'debugger' parameter; only meaningful for sub-case
+(a) and for source/binary/core modes — pre-connected attach uses whichever
+debugger was launched on the remote side):
+- 'delve' (default): For Go programs. Requires dlv in $PATH.
+- 'gdb': For C/C++/Rust. Requires GDB 14+ with native DAP (gdb -i dap). GDB
+  does not support 'source' mode; compile with debug symbols (gcc -g -O0)
+  and use 'binary' mode.
+
+Return value depends on mode:
+- 'source' / 'binary' / 'core' with initial breakpoints: blocks briefly
+  until the debuggee stops, then returns full context (location + stack +
+  variables).
+- 'attach' (both sub-cases): returns immediately with a readiness message.
+  The debuggee is already running. Set any additional breakpoints with the
+  'breakpoint' tool, then call 'continue' (no-op for pre-connected —
+  program is already going; you can also go straight to wait-for-stop) and
+  'wait-for-stop' when you're ready to block for a hit.`
 
 // registerTools registers the debugger tools with the MCP server.
 // logWriter is used to redirect adapter stderr output; pass io.Discard to suppress.
@@ -260,7 +294,7 @@ type DebugParams struct {
 	Path         string           `json:"path,omitempty" mcp:"program path (required for source/binary/core modes)"`
 	Args         []string         `json:"args,omitempty" mcp:"command line arguments for the program"`
 	CoreFilePath string           `json:"coreFilePath,omitempty" mcp:"path to core dump file (required for core mode)"`
-	ProcessID    int              `json:"processId,omitempty" mcp:"process ID (required for attach mode)"`
+	ProcessID    int              `json:"processId,omitempty" mcp:"process ID for LOCAL attach (required only when this mcp-dap-server spawns dlv locally and attaches by PID). Ignored in PRE-CONNECTED attach mode (server started with --connect / DAP_CONNECT_ADDR) — the remote dlv already knows its target. If unsure, omit it; an error will tell you if it was actually needed"`
 	Breakpoints  []BreakpointSpec `json:"breakpoints,omitempty" mcp:"initial breakpoints"`
 	StopOnEntry  bool             `json:"stopOnEntry,omitempty" mcp:"stop at program entry instead of running to first breakpoint"`
 	Port         string           `json:"port,omitempty" mcp:"port for DAP server (default: auto-assigned)"`

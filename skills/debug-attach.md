@@ -1,26 +1,70 @@
 ---
 name: debug-attach
 description: |
-  Live debugging by attaching to a running process using mcp-dap-server.
-  TRIGGER when: user asks to debug a running process, diagnose a live process by PID, attach to an already-running program, or investigate live CPU/memory/deadlock issues.
+  Live debugging by attaching to a running process (local by PID) OR to a pre-connected remote dlv in a Kubernetes pod via this fork's ConnectBackend setup.
+  TRIGGER when: user asks to debug a running process, diagnose a live process by PID, attach to an already-running program, investigate live CPU/memory/deadlock issues, or debug a Go service running in a Kubernetes pod that already has dlv --headless listening.
   DO NOT TRIGGER when: debugging from source (use debug-source), analyzing a crash dump (use debug-core-dump), or the process hasn't started yet (use debug-source or debug-binary).
 ---
 
 # Live Attach Debug Workflow
 
+## Two sub-scenarios — identify which you're in BEFORE calling debug
+
+### Sub-scenario (a): LOCAL attach by PID
+
+You want to attach to a process running **on the same machine** where this
+mcp-dap-server is running. You need the PID, `ptrace_scope` permissions,
+and a compatible debugger in `$PATH`.
+
+### Sub-scenario (b): PRE-CONNECTED (remote k8s) attach
+
+This MCP server was **pre-configured** by the operator's wrapper script
+(typically `dlv-k8s-mcp.sh`) with a `--connect <localhost:PORT>` flag or
+`DAP_CONNECT_ADDR` env var. A `kubectl port-forward` is already running in
+the wrapper's supervisor loop, and `dlv --headless --accept-multiclient`
+is listening inside a k8s pod.
+
+**You do NOT:** manage port-forward, discover a PID, pass a port, pass a
+connect address, or worry about ConnectBackend mechanics. All of that is
+operator setup in `.mcp.json`.
+
+**How to tell which sub-scenario you're in:**
+
+- If the user says anything like "debug the Go service in dev" / "the
+  kov-dev server" / "in the pod" / "the service running in k8s" — it is
+  almost certainly (b).
+- If the user says "my running process with PID 12345" / "this local
+  daemon" — it is (a).
+- If unsure, try `debug(mode="attach")` with NO processId. If the server
+  is in (b) it will work; if in (a) you'll get a clear error
+  (`processId is required for attach mode`) and you can re-call with it.
+
 ## Pre-flight checklist
 
 Before starting, gather:
-1. **PID** of the target process (use `ps aux | grep <name>` or `pgrep <name>`)
-2. **What is the observed problem?** (high CPU, hang, wrong behavior, memory leak)
-3. **Is this a production process?** Setting breakpoints will pause it for all users — be careful.
-4. **Language/runtime** — Go processes use Delve; others may need GDB
+1. **Sub-scenario (a) or (b)?** See above.
+2. **(a) only:** **PID** of the target process (`pgrep <name>` / `ps`).
+3. **What is the observed problem?** (wrong response, hang, deadlock,
+   memory leak, unexpected behavior on specific request)
+4. **Trigger:** how will you cause the breakpoint to hit? HTTP request
+   via chrome-devtools, curl, a specific user action? Prepare it before
+   setting breakpoints — wait-for-stop will block until the trigger
+   fires.
+5. **Is this a production process?** Setting breakpoints pauses it for
+   all users. For (b) in a shared dev/staging namespace, the same
+   caveat applies at a smaller scale.
 
 ## Important warnings
 
-- Attaching pauses the process. In production, this affects real users.
-- `stop()` terminates the debuggee; use `stop(detach=true)` to leave it running.
-- You may need `sudo` or `ptrace_scope=0` permissions.
+- Attaching pauses the process the moment a breakpoint fires — in
+  production that affects real users; in a shared dev environment, it
+  affects teammates.
+- `stop()` terminates the debuggee. For attach you almost always want
+  `stop(detach=true)` to leave the process running after your session.
+- For sub-scenario (a): you may need `sudo` or `ptrace_scope=0`.
+- For sub-scenario (b): **never** call `stop()` during an active session
+  that other developers may be using. Prefer `stop(detach=true)` or just
+  let the session close naturally.
 
 ---
 
@@ -28,17 +72,28 @@ Before starting, gather:
 
 ### 1. Attach to the process
 
+**Sub-scenario (a) — LOCAL:**
 ```json
 debug(mode="attach", processId=<PID>)
 ```
 
-Expected: The process pauses. You see the current execution location, stack trace, and variables.
+**Sub-scenario (b) — PRE-CONNECTED (k8s):**
+```json
+debug(mode="attach")
+```
+
+No `processId`, no port, no address. The pre-configured ConnectBackend
+routes through the wrapper's port-forward to the remote dlv.
+
+Expected result in **both** sub-scenarios (v0.2.1+): the call returns
+**immediately** with a readiness message. The debuggee is already
+running; no stop event will arrive without a trigger.
 
 If attach fails:
-- Verify PID is still running: `ps -p <PID>`
-- Check ptrace permissions: `cat /proc/sys/kernel/yama/ptrace_scope` (0 = unrestricted)
-- Try with elevated permissions if needed
-- Process may have already exited
+- Sub-scenario (a): verify PID, check `ptrace_scope`, try sudo.
+- Sub-scenario (b): tail `/tmp/mcp-dap-server.<ns>-<svc>.latest.log` — if
+  no "ConnectBackend mode" startup banner, the server wasn't
+  pre-configured and you're accidentally in (a). Ask the operator.
 
 ### 2. Understand what the process was doing
 

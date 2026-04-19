@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-04-19
+
+### Changed
+
+- **`debug` tool description now explicitly documents two `attach`
+  sub-modes.** Live-session feedback showed that Claude Code in fresh
+  conversations would read the MCP schema, see
+  `"processId (required for attach mode)"`, and either ask the operator
+  for a PID/port they don't have or refuse to call the tool at all.
+  The tool description now distinguishes **LOCAL attach by PID**
+  (sub-case a) from **PRE-CONNECTED attach via ConnectBackend**
+  (sub-case b — the `--connect` / `DAP_CONNECT_ADDR` / wrapper-script
+  scenario) and tells the caller exactly what `processId` value to use
+  (omit it in sub-case b; required in sub-case a).
+- **`DebugParams.processId` field description** rewritten to reflect
+  the sub-case distinction so the JSON schema alone is enough for the
+  model to decide correctly.
+- **`skills/debug-attach.md`** split into an explicit two-sub-scenario
+  workflow with a decision rule ("try (b) first; if you get
+  `processId is required` the setup is (a)") and troubleshooting
+  matched to each sub-case.
+- **`promptDebugAttach`** mirrors the same split in its Step 1 guidance.
+
+No behaviour change; pure documentation / tool-schema clarification.
+Existing calls with `processId` keep working in sub-case (a); existing
+calls without `processId` keep working in sub-case (b).
+
 ## [0.2.1] — 2026-04-19
 
 ### Fixed
@@ -101,6 +128,7 @@ no upstream PR is planned for the event-pump architecture.
 - New unit / integration tests for the pump, connection-loss broadcast, and
   replaceConn resume behaviour.
 
-[Unreleased]: https://github.com/vajrock/mcp-dap-server-k8s-forward/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/vajrock/mcp-dap-server-k8s-forward/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/vajrock/mcp-dap-server-k8s-forward/releases/tag/v0.2.2
 [0.2.1]: https://github.com/vajrock/mcp-dap-server-k8s-forward/releases/tag/v0.2.1
 [0.2.0]: https://github.com/vajrock/mcp-dap-server-k8s-forward/releases/tag/v0.2.0

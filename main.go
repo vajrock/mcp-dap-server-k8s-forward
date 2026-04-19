@@ -15,7 +15,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-var version = "0.2.1"
+var version = "0.2.2"
 
 func main() {
 	// CLI flag parsing
