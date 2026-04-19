@@ -29,6 +29,7 @@ type debuggerSession struct {
 	coreFilePath    string           // path to core dump file (core mode only)
 	stoppedThreadID int              // thread ID from last StoppedEvent (for adapters that use non-sequential IDs)
 	lastFrameID     int              // frame ID from last getFullContext; -1 means not set (0 is valid for GDB)
+	lastStopAt      time.Time        // time of the most recently consumed StoppedEvent (or zero for "since session start"); waitForStop Subscribes with since=lastStopAt to pick up events that fired between continue and the wait-for-stop call, instead of missing them by using since=time.Now()
 
 	// Phase 4 — breakpoints persistence across reconnects (ADR-5)
 	breakpoints         map[string][]dap.SourceBreakpoint // file path → breakpoint specs
@@ -610,7 +611,16 @@ func (ds *debuggerSession) waitForStop(ctx context.Context, _ *mcp.CallToolReque
 		timeout = 300
 	}
 
-	since := time.Now()
+	// Subscribe since the last consumed stop — not since now. This is the
+	// critical correction from v0.2.3: with since=time.Now(), any StoppedEvent
+	// that arrived BEFORE wait-for-stop was invoked (e.g. because the breakpoint
+	// fired while the model was still building its next tool call) would be
+	// missed, the replay ring holds events by their arrival time, so a subscribe
+	// with since=earlier replays it. Initialized to zero-time at session start,
+	// so the first wait-for-stop catches any stop that already happened.
+	ds.mu.Lock()
+	since := ds.lastStopAt
+	ds.mu.Unlock()
 	waitCtx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
 	defer cancel()
 
@@ -619,10 +629,18 @@ func (ds *debuggerSession) waitForStop(ctx context.Context, _ *mcp.CallToolReque
 	case err == nil && stopped != nil:
 		ds.mu.Lock()
 		ds.stoppedThreadID = stopped.Body.ThreadId
+		// Advance lastStopAt PAST this event's ring timestamp so the next
+		// wait-for-stop doesn't replay it. time.Now() is strictly greater than
+		// the event's ring timestamp (which was captured when dispatchEvent ran,
+		// necessarily earlier than this handler's current instant).
+		ds.lastStopAt = time.Now()
 		result, _, gerr := ds.getFullContext(ctx, stopped.Body.ThreadId, 0, 20)
 		ds.mu.Unlock()
 		return result, nil, gerr
 	case err == nil && terminated != nil:
+		ds.mu.Lock()
+		ds.lastStopAt = time.Now()
+		ds.mu.Unlock()
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: "Program terminated"}},
 		}, nil, nil
@@ -632,7 +650,12 @@ func (ds *debuggerSession) waitForStop(ctx context.Context, _ *mcp.CallToolReque
 				Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf(`{"status":"still_running","elapsedSec":%d}`, timeout)}},
 			}, nil, nil
 		}
-		// Send a pause and wait (bounded) for the resulting stopped-event.
+		// Send a pause and fall back to a synthesised context. Some DAP
+		// adapters (observed: dlv v1.25 --accept-multiclient on threads
+		// blocked in network I/O) acknowledge a PauseRequest but never
+		// emit the corresponding StoppedEvent. pauseAndCaptureContext now
+		// builds the context from ThreadsRequest + StackTraceRequest when
+		// the event does not arrive within a short window.
 		return ds.pauseAndCaptureContext(ctx, input.ThreadID.Int())
 	default:
 		// Includes ctx.Err() from the caller's own deadline and any other error.
@@ -641,8 +664,15 @@ func (ds *debuggerSession) waitForStop(ctx context.Context, _ *mcp.CallToolReque
 }
 
 // pauseAndCaptureContext sends a PauseRequest on the given thread (or the
-// default one if 0), waits briefly for the resulting StoppedEvent, and returns
-// the full context captured at that stop.
+// default one if 0) and returns the full context at the paused location.
+//
+// It first waits briefly for the DAP StoppedEvent produced by the pause.
+// If the event does not arrive within a short window (some adapters, notably
+// dlv v1.25+ --accept-multiclient on threads blocked in network I/O,
+// acknowledge the PauseRequest but never emit StoppedEvent), the context is
+// synthesised directly from ThreadsRequest + StackTraceRequest on the paused
+// thread. PauseResponse success means the thread is halted in the adapter,
+// so the stack trace is safe to query even without the event.
 func (ds *debuggerSession) pauseAndCaptureContext(ctx context.Context, threadID int) (*mcp.CallToolResult, any, error) {
 	ds.mu.Lock()
 	if ds.client == nil {
@@ -664,17 +694,36 @@ func (ds *debuggerSession) pauseAndCaptureContext(ctx context.Context, threadID 
 	}
 	ds.mu.Unlock()
 
-	// Bounded wait for the StoppedEvent produced by the pause.
-	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	// Short bounded wait for a StoppedEvent. If it arrives, use its threadId
+	// (which might differ from the requested one in multi-threaded adapters).
+	// Otherwise fall back to the synthesised context path below.
+	const pauseStopWait = 2 * time.Second
+	waitCtx, cancel := context.WithTimeout(ctx, pauseStopWait)
 	defer cancel()
-	stopped, _, err := awaitStopOrTerminate(waitCtx, ds.client, since)
-	if err != nil {
-		return nil, nil, fmt.Errorf("pause succeeded but no StoppedEvent within 10s: %w", err)
+	stopped, _, waitErr := awaitStopOrTerminate(waitCtx, ds.client, since)
+
+	stopThreadID := threadID
+	switch {
+	case waitErr == nil && stopped != nil:
+		stopThreadID = stopped.Body.ThreadId
+	case errors.Is(waitErr, context.DeadlineExceeded):
+		// Adapter did not emit StoppedEvent — synthesise from the thread
+		// we paused. Fall through to the common "build context" path below.
+		logAt(LogDebug, "pauseAndCaptureContext: no StoppedEvent within %s after pause seq=%d — using thread %d for synthesised context", pauseStopWait, pauseSeq, threadID)
+	case errors.Is(waitErr, ErrConnectionStale):
+		return nil, nil, waitErr
+	default:
+		// Caller's ctx cancelled, or something else — propagate.
+		return nil, nil, waitErr
 	}
 
 	ds.mu.Lock()
-	ds.stoppedThreadID = stopped.Body.ThreadId
-	result, _, gerr := ds.getFullContext(ctx, stopped.Body.ThreadId, 0, 20)
+	ds.stoppedThreadID = stopThreadID
+	// Update lastStopAt so subsequent waitForStop does not replay whatever
+	// led us here (breakpoint event before the timeout, or the pause event
+	// if it did arrive).
+	ds.lastStopAt = time.Now()
+	result, _, gerr := ds.getFullContext(ctx, stopThreadID, 0, 20)
 	ds.mu.Unlock()
 	return result, nil, gerr
 }
@@ -996,6 +1045,7 @@ func (ds *debuggerSession) cleanup() {
 	ds.capabilities = dap.Capabilities{}
 	ds.stoppedThreadID = 0
 	ds.lastFrameID = -1
+	ds.lastStopAt = time.Time{}
 	ds.unregisterSessionTools()
 }
 
@@ -1230,6 +1280,12 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, in
 	// Launch response was already consumed above via AwaitResponse(launchSeq);
 	// any unrelated DAP events that arrived during startup went to the event bus
 	// (dropped if no subscriber).
+	//
+	// Mark session-start boundary in lastStopAt so the first wait-for-stop
+	// does not replay the debuggee's entry StoppedEvent (spawn modes always
+	// emit one on entry, before we issue continue). Subsequent stop events
+	// consumed by waitForStop/step/etc. advance lastStopAt further.
+	ds.lastStopAt = time.Now()
 
 	// Register session-specific tools based on capabilities
 	ds.registerSessionTools()
@@ -1247,6 +1303,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, in
 		if ds.stoppedThreadID == 0 {
 			ds.stoppedThreadID = 1
 		}
+		ds.lastStopAt = time.Now()
 		return ds.getFullContext(ctx, ds.stoppedThreadID, 0, 20)
 	}
 
@@ -1302,11 +1359,13 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, in
 				}
 				stoppedThreadID = ev.Body.ThreadId
 				ds.stoppedThreadID = stoppedThreadID
+				ds.lastStopAt = time.Now()
 				break waitLoop
 			case _, ok := <-termSub:
 				if !ok {
 					return nil, nil, ErrConnectionStale
 				}
+				ds.lastStopAt = time.Now()
 				break waitLoop
 			case lost, ok := <-lostSub:
 				if !ok {
@@ -1432,11 +1491,13 @@ func (ds *debuggerSession) step(ctx context.Context, _ *mcp.CallToolRequest, inp
 		return nil, nil, err
 	}
 	if terminated != nil {
+		ds.lastStopAt = time.Now()
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: "Program terminated"}},
 		}, nil, nil
 	}
 	ds.stoppedThreadID = stopped.Body.ThreadId
+	ds.lastStopAt = time.Now()
 	return ds.getFullContext(ctx, stopped.Body.ThreadId, 0, 20)
 }
 
@@ -1735,6 +1796,7 @@ func (ds *debuggerSession) reinitialize(ctx context.Context) error {
 	// evaluate) fall back to safe defaults when these are 0/-1 respectively.
 	ds.stoppedThreadID = 0
 	ds.lastFrameID = -1
+	ds.lastStopAt = time.Time{}
 
 	logAt(LogDebug, "reinitialize: completed (%d source breakpoints, %d function breakpoints re-applied)",
 		applied, len(ds.functionBreakpoints))

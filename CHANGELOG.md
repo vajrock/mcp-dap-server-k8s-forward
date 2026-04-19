@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-04-20
+
+### Added
+
+- **`--version` CLI flag.** Prints the compiled version string and exits.
+  Previously the version was only visible in the startup log line; now
+  operators can check the installed binary with a one-shot
+  `mcp-dap-server-k8s-forward --version`.
+
+### Fixed
+
+- **`wait-for-stop` no longer misses stop events that fired before the
+  call.** In v0.2.0–0.2.2, the handler subscribed with `since=time.Now()`,
+  which meant a `StoppedEvent` arriving between `continue` and
+  `wait-for-stop` (e.g. because the breakpoint fire was faster than the
+  model's next tool-call) would fall into the replay ring but never be
+  delivered — the subscription asked only for future events.
+  The handler now subscribes with `since=ds.lastStopAt`, tracked on the
+  `debuggerSession`. Initialized to zero-time at session start (so the
+  first `wait-for-stop` picks up any stop already in the ring) and
+  advanced to `time.Now()` after each successful stop consumption. Also
+  applied to the `step`, `debug` (core & breakpoint-wait), and
+  `pauseAndCaptureContext` code paths.
+
+- **`pauseAndCaptureContext` synthesises context when the adapter does
+  not emit `StoppedEvent`.** Observed with dlv v1.25+
+  `--accept-multiclient` on threads blocked in network I/O:
+  `PauseResponse` arrives OK, thread is halted in the adapter, but
+  the `StoppedEvent` never fires. Previously that produced a user-
+  visible error "pause succeeded but no StoppedEvent within 10s".
+  Now, after a 2-second wait for the event, the handler falls back to
+  `ThreadsRequest` + `StackTraceRequest` on the paused thread and
+  returns the full context just as if the event had arrived. Log entry
+  at debug level records the fallback for post-mortem.
+
+These two fixes together eliminate the class of "session hangs because
+the stop event was missed" problems reported from the first v0.2.x
+production runs.
+
 ## [0.2.2] — 2026-04-19
 
 ### Changed
@@ -128,7 +167,8 @@ no upstream PR is planned for the event-pump architecture.
 - New unit / integration tests for the pump, connection-loss broadcast, and
   replaceConn resume behaviour.
 
-[Unreleased]: https://github.com/vajrock/mcp-dap-server-k8s-forward/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/vajrock/mcp-dap-server-k8s-forward/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/vajrock/mcp-dap-server-k8s-forward/releases/tag/v0.2.3
 [0.2.2]: https://github.com/vajrock/mcp-dap-server-k8s-forward/releases/tag/v0.2.2
 [0.2.1]: https://github.com/vajrock/mcp-dap-server-k8s-forward/releases/tag/v0.2.1
 [0.2.0]: https://github.com/vajrock/mcp-dap-server-k8s-forward/releases/tag/v0.2.0
