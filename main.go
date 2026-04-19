@@ -15,7 +15,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-var version = "0.2.0"
+var version = "0.2.1"
 
 func main() {
 	// CLI flag parsing
@@ -28,11 +28,22 @@ func main() {
 		addr = os.Getenv("DAP_CONNECT_ADDR")
 	}
 
-	// Log to a per-PID file so multiple concurrent mcp-dap-server instances
-	// don't clobber each other's logs. Never write to stderr — with MCP stdio
-	// transport stderr is a pipe to the MCP client, and a full pipe buffer
-	// would block the logging goroutine and hang the server.
-	logPath := filepath.Join(os.TempDir(), fmt.Sprintf("mcp-dap-server.%d.log", os.Getpid()))
+	// Log to a file tagged by the k8s target (if known) and PID so multiple
+	// concurrent mcp-dap-server instances don't clobber each other's logs
+	// and operators can find the right file without guessing PIDs.
+	//
+	// DLV_NAMESPACE + DLV_SERVICE come from the wrapper script (dlv-k8s-mcp.sh)
+	// and get inherited. Fallback to PID-only naming when they aren't set
+	// (local dlv/gdb spawn, direct invocation, etc.).
+	//
+	// Never write to stderr — with MCP stdio transport stderr is a pipe to
+	// the MCP client, and a full pipe buffer would block the logging goroutine
+	// and hang the server.
+	tag := ""
+	if ns, svc := os.Getenv("DLV_NAMESPACE"), os.Getenv("DLV_SERVICE"); ns != "" && svc != "" {
+		tag = ns + "-" + svc + "."
+	}
+	logPath := filepath.Join(os.TempDir(), fmt.Sprintf("mcp-dap-server.%s%d.log", tag, os.Getpid()))
 	var logWriter io.Writer
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
@@ -58,9 +69,12 @@ func main() {
 	log.Printf("mcp-dap-server starting (version=%s log=%s connect=%q level=%s)",
 		version, logPath, addr, currentLogLevel.String())
 
-	// Maintain a convenience "latest" symlink pointing at the active session's
-	// log. Best-effort — a failure here is noted but not fatal.
-	latestPath := filepath.Join(os.TempDir(), "mcp-dap-server.latest.log")
+	// Maintain a convenience "latest" symlink per target tag so running two
+	// wrapped mcp-dap-server instances (e.g. server + ca) each get their own
+	// latest.log that points at that tag's current session. Untagged fallback
+	// uses mcp-dap-server.latest.log as before. Best-effort — failures logged
+	// but not fatal.
+	latestPath := filepath.Join(os.TempDir(), fmt.Sprintf("mcp-dap-server.%slatest.log", tag))
 	_ = os.Remove(latestPath)
 	if err := os.Symlink(logPath, latestPath); err != nil {
 		log.Printf("warn: could not create latest.log symlink: %v", err)
