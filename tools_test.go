@@ -2393,11 +2393,11 @@ func TestReinitialize_ConcurrentBreakpointMutation_NoRace(t *testing.T) {
 // process) hangs on this machine for reasons unrelated to our code. Keeping
 // only the unit-level assertions below.
 
-// TestVersion_Is020 verifies the compiled binary version string tracks the
-// 0.2.0 release.
-func TestVersion_Is020(t *testing.T) {
-	if version != "0.2.0" {
-		t.Fatalf("expected version 0.2.0, got %q (did you forget to bump main.go?)", version)
+// TestVersion_Is021 verifies the compiled binary version string tracks the
+// 0.2.1 release.
+func TestVersion_Is021(t *testing.T) {
+	if version != "0.2.1" {
+		t.Fatalf("expected version 0.2.1, got %q (did you forget to bump main.go?)", version)
 	}
 }
 

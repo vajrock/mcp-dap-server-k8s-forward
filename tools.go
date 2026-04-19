@@ -1216,17 +1216,31 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, in
 		return ds.getFullContext(ctx, ds.stoppedThreadID, 0, 20)
 	}
 
-	// If we have breakpoints and not explicitly stopping on entry, wait for the
-	// debuggee to reach a breakpoint. Different adapters behave differently:
+	// In "attach" mode (local attach by PID or remote attach via ConnectBackend)
+	// the debuggee is already running; no entry-stop will arrive and blocking
+	// here would hang the MCP call forever if no breakpoint is hit without an
+	// external trigger. Return immediately with a running status and let the
+	// caller invoke wait-for-stop when a hit is expected.
+	if mode == "attach" {
+		msg := "Attach debug session ready. Breakpoints set. Call 'wait-for-stop' when an external trigger is expected to hit a breakpoint."
+		if len(input.Breakpoints) == 0 {
+			msg = "Attach debug session ready. Set breakpoints with the 'breakpoint' tool, then call 'wait-for-stop' when ready to block for a hit."
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.TextContent{Text: msg}},
+		}, nil, nil
+	}
+
+	// Spawn modes (source/binary): the debuggee is stopped (at entry or before
+	// the first breakpoint) after ConfigurationDone. If the caller asked for
+	// initial breakpoints and did NOT request stop-on-entry, consume the
+	// entry-stop and wait for the real breakpoint.
 	//
 	// Delve: stops at entry point first (reason="entry"), then requires
 	// ContinueRequest to proceed to the breakpoint.
 	//
-	// GDB native DAP: with stopAtBeginningOfMainSubprogram=false, may run directly to breakpoint
-	// without stopping at entry first.
-	//
-	// We handle both by reading the first StoppedEvent. If it's an entry stop,
-	// we send ContinueRequest and wait for the next stop.
+	// GDB native DAP: with stopAtBeginningOfMainSubprogram=false, may run
+	// directly to breakpoint without stopping at entry first.
 	if len(input.Breakpoints) > 0 && !input.StopOnEntry {
 		stopSub, stopCancel := Subscribe[*dap.StoppedEvent](ds.client, since)
 		defer stopCancel()
